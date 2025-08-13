@@ -1,0 +1,335 @@
+import { Buffer } from "node:buffer";
+import process from "node:process";
+import WebSocket from "tcp-websocket";
+import {
+  BaseStream,
+  ObjectDisposedError,
+  SshAlgorithms,
+  SshClientSession,
+  SshDisconnectReason,
+  SshProtocolExtensionNames,
+  SshSessionConfiguration,
+  Stream,
+} from "@microsoft/dev-tunnels-ssh";
+import { PortForwardingService } from "@microsoft/dev-tunnels-ssh-tcp";
+import { ChildProcess, StdioOptions } from "node:child_process";
+
+interface SpawnOptions {
+  stdio: StdioOptions | undefined;
+  env?: Record<string, string | undefined>;
+  cwd?: string;
+  onExit?: (
+    exitCode: number | null,
+    signalCode:
+      | Deno.Signal
+      | NodeJS.Signals
+      | number
+      | string
+      | null
+      | undefined,
+  ) => void;
+}
+const sessionMap: Map<string, SshClientSession> = new Map();
+function closeSessions(sessions?: string[]): void {
+  Array.from(sessionMap.entries()).forEach(([key, session]) => {
+    if (sessions && !sessions.includes(key)) {
+      return;
+    }
+    void session.close(SshDisconnectReason.byApplication);
+    sessionMap.delete(key);
+  });
+}
+async function spawnProcess(
+  command: string,
+  args: string[],
+  options: SpawnOptions,
+): Promise<Bun.Subprocess | Deno.ChildProcess | ChildProcess> {
+  const runtime = navigator.userAgent;
+  if (runtime.startsWith("Bun")) {
+    try {
+      const sshBunCommand = Bun.spawn({
+        cmd: [command, ...args],
+        stdio: ["inherit", "inherit", "inherit"],
+        env: options.env,
+        cwd: options.cwd,
+      });
+      void sshBunCommand.exited.then(() => {
+        options.onExit?.(
+          sshBunCommand.exitCode,
+          sshBunCommand.signalCode ?? null,
+        );
+      }).catch(() => {
+        options.onExit?.(
+          sshBunCommand.exitCode,
+          sshBunCommand.signalCode ?? null,
+        );
+      });
+      return sshBunCommand;
+    } catch (error) {
+      console.error("Failed to spawn Bun process:", error);
+      throw error;
+    }
+  } else if (runtime.startsWith("Deno")) {
+    const sshDenoCommand = new Deno.Command(command, {
+      args: args,
+      stdin: "inherit",
+      stdout: "inherit",
+    });
+    const sshChildProcess: Deno.ChildProcess = sshDenoCommand.spawn();
+    // Handle exit asynchronously
+    sshChildProcess.status.then((status: Deno.CommandStatus) => {
+      options.onExit?.(status.code, status.signal ?? null);
+    });
+    return sshChildProcess;
+  } else {
+    // Node.js - use standard spawn
+    const { spawn } = await import("node:child_process");
+    const sshProcess = spawn(command, args, options);
+    sshProcess.on("exit", (code, signal) => {
+      options.onExit?.(code, signal);
+    });
+    return sshProcess;
+  }
+}
+/* istanbul ignore next */
+class connectionClientStream extends BaseStream {
+  public constructor(private readonly connection: import("undici").WebSocket) {
+    super();
+    this.connection.binaryType = "arraybuffer";
+    console.log("[WebSocket] Setting up event listeners");
+
+    this.connection.addEventListener(
+      "message",
+      (event) => {
+        console.log(
+          `[WebSocket] Received message, type: ${typeof event.data}, size: ${
+            event.data?.byteLength || event.data?.length || "unknown"
+          }`,
+        );
+
+        let buffer: Buffer;
+        if (event.data instanceof ArrayBuffer) {
+          buffer = Buffer.from(event.data);
+        } else if (ArrayBuffer.isView(event.data)) {
+          buffer = Buffer.from(
+            event.data.buffer,
+            event.data.byteOffset,
+            event.data.byteLength,
+          );
+        } else if (typeof event.data === "string") {
+          buffer = Buffer.from(event.data);
+        } else {
+          console.error(
+            `[WebSocket] Received unsupported message type: ${typeof event
+              .data}`,
+          );
+          return;
+        }
+
+        console.log(
+          `[WebSocket] Forwarding data of size ${buffer.length} to SSH layer`,
+        );
+        this.onData(buffer);
+      },
+    );
+
+    this.connection.addEventListener("close", (event: CloseEvent) => {
+      console.log(
+        `[WebSocket] Connection closed, code: ${event.code}, reason: ${event.reason}`,
+      );
+      if (!event.code || event.code === 1000) {
+        this.onEnd();
+      } else {
+        const error = new Error(
+          event.reason || "WebSocket closed unexpectedly",
+        ) as Error & { code?: number };
+        error.code = event.code;
+        this.onError(error);
+      }
+    });
+
+    this.connection.addEventListener("error", (event: Event) => {
+      const errorMessage = (event as ErrorEvent).message ||
+        "Unknown WebSocket error";
+      console.error(`[WebSocket] Error occurred: ${errorMessage}`);
+      const error = new Error(errorMessage) as Error & { code?: number };
+      error.code = 1006; // Abnormal closure
+      this.onError(error);
+    });
+  }
+
+  public write(data: Buffer): Promise<void> {
+    if (this.disposed) {
+      throw new ObjectDisposedError(this);
+    }
+    if (!data) {
+      throw new TypeError("Data is required.");
+    }
+    console.log(`[WebSocket] Sending data of size ${data.length}`);
+    this.connection.send(data);
+    return Promise.resolve();
+  }
+
+  public close(error?: Error): Promise<void> {
+    if (this.disposed) {
+      throw new ObjectDisposedError(this);
+    }
+    if (!error) {
+      console.log("[WebSocket] Closing connection normally");
+      this.connection.close(1000);
+    } else {
+      console.log(
+        `[WebSocket] Closing connection with error: ${error.message}`,
+      );
+      this.connection.close(
+        (error as Error & { code?: number }).code ?? 1011,
+        error.message,
+      );
+    }
+    this.disposed = true;
+    this.closedEmitter.fire({ error });
+    this.onError(error || new Error("Stream closed."));
+    return Promise.resolve();
+  }
+
+  public override dispose(): void {
+    if (!this.disposed) {
+      console.log("[WebSocket] Disposing connection");
+      this.connection.close(1000);
+    }
+    super.dispose();
+  }
+}
+
+const runtime = typeof Bun !== "undefined" ? "Bun" : "Node.js";
+console.log(`[Client] Attempting to connect using ${runtime}...`);
+
+
+async function testSSH() {
+  const serverURI = "ws://localhost:8080";
+  const sessionMap = new Map();
+
+  // close the opened session if exists
+  const isContinue = new Promise((res) => {
+    const session = sessionMap.get(serverURI);
+    if (session) {
+      void session
+        .close(SshDisconnectReason.byApplication)
+        .finally(() => res(true));
+    } else {
+      res(true);
+    }
+  });
+  await isContinue;
+  const config = new SshSessionConfiguration();
+
+  config.keyExchangeAlgorithms.splice(0, config.keyExchangeAlgorithms.length);
+  config.publicKeyAlgorithms.splice(0, config.publicKeyAlgorithms.length);
+
+  config.keyExchangeAlgorithms.push(
+    SshAlgorithms.keyExchange.ecdhNistp256Sha256!,
+  );
+  config.keyExchangeAlgorithms.push(SshAlgorithms.keyExchange.ecdhNistp521Sha512!);
+  config.publicKeyAlgorithms.push(SshAlgorithms.publicKey.ecdsaSha2Nistp521!);
+  config.publicKeyAlgorithms.push(SshAlgorithms.publicKey.rsa2048!);
+  config.encryptionAlgorithms.push(SshAlgorithms.encryption.aes256Gcm!);
+  config.protocolExtensions.push(SshProtocolExtensionNames.sessionReconnect);
+  config.protocolExtensions.push(SshProtocolExtensionNames.sessionLatency);
+  config.addService(PortForwardingService);
+  // In the ssh function, change the WebSocket instantiation:
+  const websocket = new WebSocket(serverURI, {
+    protocols: ["ssh"],
+  });
+
+  const stream = await new Promise<Stream>((resolve, reject) => {
+    websocket.addEventListener("open", () => {
+      console.log("[WebSocket] Connection opened, creating stream");
+      resolve(new connectionClientStream(websocket));
+    });
+
+    websocket.addEventListener("error", (event: Event) => {
+      const errorMessage = (event as ErrorEvent).message || "Unknown error";
+      console.error(`[WebSocket] Connection error: ${errorMessage}`);
+      reject(
+        new Error(
+          `Failed to connect to server at ${serverURI}: ${errorMessage}`,
+        ),
+      );
+    });
+
+    // Add a timeout in case the connection hangs
+    setTimeout(() => {
+      if (!websocket.readyState || websocket.readyState !== 1) { // 1 = OPEN
+        console.error("[WebSocket] Connection timeout");
+        reject(new Error(`Connection timeout to ${serverURI}`));
+      }
+    }, 10000); // 10 second timeout
+  });
+  const session = new SshClientSession(config);
+  try {
+    await session.connect(stream);
+    void session.onAuthenticating((error) => {
+      // there is no authentication in this solution
+      error.authenticationPromise = Promise.resolve({});
+    });
+    const opts = {
+      displayName: "test",
+      client: { port: "33333" },
+      username: "user",
+      pkFilePath: "./container-key", 
+    };
+    await session.authenticateClient({
+      username: opts.username,
+      publicKeys: [],
+    });
+    const pfs: PortForwardingService = session.activateService(
+      PortForwardingService,
+    );
+    const localPort: number = parseInt(opts.client.port, 10);
+    await pfs.forwardToRemotePort(
+      "127.0.0.1", 
+      localPort, 
+      "127.0.0.1", 
+      2223, 
+    );
+
+    sessionMap.set(serverURI, session);
+
+    const sshArgs: string[] = [
+      "-v",
+      "-i",
+      opts.pkFilePath,
+      "-p",
+      `${localPort}`,
+      "-o",
+      "StrictHostKeyChecking=no", 
+      "-o",
+      "UserKnownHostsFile=/dev/null", // Avoids polluting known_hosts for localhost ports
+      `${opts.username}@127.0.0.1`,
+    ];
+
+    await spawnProcess("ssh", sshArgs, {
+      stdio: "inherit",
+      env: process.env,
+      onExit(exitCode: number | null, signalCode) {
+        // When the user’s ssh exits, close the tunneled session cleanly
+        console.log(
+          `SSH process exited (code=${exitCode}, signal=${signalCode}), closing tunnel…`,
+        );
+        void session.close(SshDisconnectReason.byApplication)
+          .catch((err) => console.error("Error closing SSH session:", err));
+        sessionMap.delete(serverURI);
+        closeSessions();
+      },
+    });
+  } catch (error) {
+    if (error instanceof Error) {
+      console.log(`SSH session dropped : ${error?.message}`);
+    }
+  }
+}
+
+testSSH().catch((error) => {
+  console.error(`[Client] Unhandled error: ${error.message}`);
+  process.exit(1);
+});

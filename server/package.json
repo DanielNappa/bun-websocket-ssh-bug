@@ -1,0 +1,24 @@
+{
+  "name": "dev-tunnel-server",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@microsoft/dev-tunnels-ssh": "3.11.33",
+    "@microsoft/dev-tunnels-ssh-tcp": "3.11.33",
+    "@microsoft/dev-tunnels-ssh-keys": "3.11.33",
+    "websocket": "1.0.35",
+    "yargs": "17.7.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/websocket": "1.0.10",
+    "@types/yargs": "17.0.31",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}

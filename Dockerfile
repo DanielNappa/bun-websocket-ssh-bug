@@ -1,0 +1,55 @@
+# Use a lightweight base image
+FROM alpine:latest
+
+# Install Dropbear SSH server, bash, and openssl for SSL certificates
+RUN apk update && apk add --no-cache dropbear bash openssl openssh-keygen
+
+# Create user and directories for Dropbear host keys and SSL certificates
+RUN adduser -D -s /bin/bash user && \
+    mkdir -p /var/lib/dropbear /var/run/dropbear /etc/ssl/certs /home/user/.ssh /root/.ssh
+
+# Generate SSL certificate for WSS
+RUN openssl req -x509 -newkey rsa:2048 -keyout /etc/ssl/certs/server.key -out /etc/ssl/certs/server.crt -days 365 -nodes -subj "/C=US/ST=State/L=City/O=Organization/OU=OrgUnit/CN=localhost"
+
+# Copy host-generated public key for authentication
+COPY container-key.pub /home/user/.ssh/authorized_keys
+COPY container-key.pub /root/.ssh/authorized_keys
+
+# Set permissions for SSH directories and keys
+RUN chmod 700 /root/.ssh /home/user/.ssh && \
+    chmod 600 /root/.ssh/authorized_keys /home/user/.ssh/authorized_keys && \
+    chown -R user:user /home/user/.ssh && \
+    chown -R root:root /root/.ssh
+
+# Create dropbear startup script - P-521 ONLY
+RUN cat > /start-dropbear.sh << 'EOF'
+#!/bin/sh
+
+SSHD_PORT="${SSHD_PORT:-2223}"
+echo "SSHD PORT IS: $SSHD_PORT"
+
+# Generate ONLY P-521 host key
+echo "Generate P-521 host key ONLY"
+/usr/bin/dropbearkey -t ecdsa -s 256 -f /var/lib/dropbear/dropbear_ecdsa_p256_host_key
+
+# Start dropbear with ONLY P-521 host key
+echo "Start dropbear process with P-521 ONLY"
+exec /usr/sbin/dropbear \
+  -F \
+  -E \
+  -s \
+  -w \
+  -W 65536 \
+  -p $SSHD_PORT \
+  -P /var/run/dropbear/dropbear.pid \
+  -K 30 \
+  -r /var/lib/dropbear/dropbear_ecdsa_p256_host_key
+EOF
+
+RUN chmod +x /start-dropbear.sh
+
+# Expose the default SSH port
+EXPOSE 22
+
+# Use the SAP Dev Space startup script
+CMD ["/start-dropbear.sh"]
