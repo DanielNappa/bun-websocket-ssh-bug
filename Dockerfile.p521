@@ -30,7 +30,7 @@ echo "SSHD PORT IS: $SSHD_PORT"
 
 # Generate ONLY P-521 host key
 echo "Generate P-521 host key ONLY"
-/usr/bin/dropbearkey -t ecdsa -s 256 -f /var/lib/dropbear/dropbear_ecdsa_p256_host_key
+/usr/bin/dropbearkey -t ecdsa -s 521 -f /var/lib/dropbear/dropbear_ecdsa_p521_host_key
 
 # Start dropbear with ONLY P-521 host key
 echo "Start dropbear process with P-521 ONLY"
@@ -43,7 +43,7 @@ exec /usr/sbin/dropbear \
   -p $SSHD_PORT \
   -P /var/run/dropbear/dropbear.pid \
   -K 30 \
-  -r /var/lib/dropbear/dropbear_ecdsa_p256_host_key
+  -r /var/lib/dropbear/dropbear_ecdsa_p521_host_key
 EOF
 
 RUN chmod +x /start-dropbear.sh

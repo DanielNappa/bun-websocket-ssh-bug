@@ -6,6 +6,7 @@
   "dependencies": {
     "@microsoft/dev-tunnels-ssh": "^3.12.5",
     "@microsoft/dev-tunnels-ssh-tcp": "^3.12.5",
+    "tcp-websocket": "^1.0.0",
     "undici": "^7.13.0",
     "ws": "^8.18.3"
   },

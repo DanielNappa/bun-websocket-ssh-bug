@@ -9,9 +9,9 @@ echo
 echo "Cleaning up existing keys..."
 rm -f container-key container-key.pub
 
-# Generate deterministic P-256 keypair on host
-echo "Generating P-256 keypair on host..."
-ssh-keygen -t ecdsa -b 256 -f container-key -N "" -C "bun-ws-repro"
+# Generate deterministic P-521 keypair on host
+echo "Generating P-521 keypair on host..."
+ssh-keygen -t ecdsa -b 521 -f container-key -N "" -C "bun-ws-repro"
 echo "✓ Generated container-key and container-key.pub"
 
 # Stop and remove existing container
@@ -21,7 +21,7 @@ docker rm ssh-server 2>/dev/null || true
 
 # Build the Docker image
 echo "Building Docker image..."
-docker build -t ssh-server  -f Dockerfile.p256 .
+docker build -t ssh-server  -f Dockerfile.p521 .
 echo "✓ Built ssh-server image"
 
 # Start the container
