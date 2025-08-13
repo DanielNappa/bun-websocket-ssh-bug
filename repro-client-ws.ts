@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import process from "node:process";
-import WebSocket from "tcp-websocket";
+import WebSocket from "ws";
 import {
   BaseStream,
   ObjectDisposedError,
@@ -43,7 +43,7 @@ async function spawnProcess(
   command: string,
   args: string[],
   options: SpawnOptions,
-): Promise<Bun.Subprocess | Deno.ChildProcess | ChildProcess> {
+): Promise<Bun.Subprocess | ChildProcess> {
   const runtime = navigator.userAgent;
   if (runtime.startsWith("Bun")) {
     try {
@@ -79,70 +79,39 @@ async function spawnProcess(
     return sshProcess;
   }
 }
-/* istanbul ignore next */
+
 class connectionClientStream extends BaseStream {
-  public constructor(private readonly connection: import("undici").WebSocket) {
+  public constructor(private readonly connection: WebSocket) {
     super();
-    this.connection.binaryType = "arraybuffer";
-    console.log("[WebSocket] Setting up event listeners");
-
-    this.connection.addEventListener(
+    connection.on(
       "message",
-      (event) => {
-        console.log(
-          `[WebSocket] Received message, type: ${typeof event.data}, size: ${
-            event.data?.byteLength || event.data?.length || "unknown"
-          }`,
-        );
-
-        let buffer: Buffer;
-        if (event.data instanceof ArrayBuffer) {
-          buffer = Buffer.from(event.data);
-        } else if (ArrayBuffer.isView(event.data)) {
-          buffer = Buffer.from(
-            event.data.buffer,
-            event.data.byteOffset,
-            event.data.byteLength,
+      (data: WebSocket.RawData, isBinary: boolean) => {
+        if (isBinary) {
+          const buffer: Buffer<ArrayBufferLike> = Buffer.isBuffer(data)
+            ? data
+            : Buffer.from(data as ArrayBuffer);
+          console.log(
+            `[WebSocket] Received message, type: ${typeof data}, size: ${
+              data instanceof ArrayBuffer
+                ? data.byteLength
+                : Object.keys(data).length || data?.length || "unknown"
+            }`,
           );
-        } else if (typeof event.data === "string") {
-          buffer = Buffer.from(event.data);
-        } else {
-          console.error(
-            `[WebSocket] Received unsupported message type: ${typeof event
-              .data}`,
-          );
-          return;
+          this.onData(buffer);
         }
-
-        console.log(
-          `[WebSocket] Forwarding data of size ${buffer.length} to SSH layer`,
-        );
-        this.onData(buffer);
       },
     );
-
-    this.connection.addEventListener("close", (event: CloseEvent) => {
-      console.log(
-        `[WebSocket] Connection closed, code: ${event.code}, reason: ${event.reason}`,
-      );
-      if (!event.code || event.code === 1000) {
+    connection.on("close", (code?: number, reason?: string) => {
+      if (!code) {
+        console.log(
+          `[WebSocket] Connection closed, code: ${code}, reason: ${reason}`,
+        );
         this.onEnd();
       } else {
-        const error = new Error(
-          event.reason || "WebSocket closed unexpectedly",
-        ) as Error & { code?: number };
-        error.code = event.code;
+        const error = new Error(reason) as Error & { code?: number };
+        error.code = code ?? 1011;
         this.onError(error);
       }
-    });
-
-    this.connection.addEventListener("error", (event: Event) => {
-      const errorMessage = (event as ErrorEvent).message ||
-        "Unknown WebSocket error";
-      console.error(`[WebSocket] Error occurred: ${errorMessage}`);
-      const error = new Error(errorMessage) as Error & { code?: number };
-      error.code = 1006; // Abnormal closure
-      this.onError(error);
     });
   }
 
@@ -153,6 +122,7 @@ class connectionClientStream extends BaseStream {
     if (!data) {
       throw new TypeError("Data is required.");
     }
+
     console.log(`[WebSocket] Sending data of size ${data.length}`);
     this.connection.send(data);
     return Promise.resolve();
@@ -162,6 +132,7 @@ class connectionClientStream extends BaseStream {
     if (this.disposed) {
       throw new ObjectDisposedError(this);
     }
+
     if (!error) {
       console.log("[WebSocket] Closing connection normally");
       this.connection.close(1000);
@@ -182,8 +153,7 @@ class connectionClientStream extends BaseStream {
 
   public override dispose(): void {
     if (!this.disposed) {
-      console.log("[WebSocket] Disposing connection");
-      this.connection.close(1000);
+      this.connection.close();
     }
     super.dispose();
   }
@@ -226,17 +196,15 @@ async function testSSH() {
   config.protocolExtensions.push(SshProtocolExtensionNames.sessionLatency);
   config.addService(PortForwardingService);
   // In the ssh function, change the WebSocket instantiation:
-  const websocket = new WebSocket(serverURI, {
-    protocols: ["ssh"],
-  });
+  const websocket = new WebSocket(serverURI, "ssh");
 
   const stream = await new Promise<Stream>((resolve, reject) => {
-    websocket.addEventListener("open", () => {
+    websocket.on("open", () => {
       console.log("[WebSocket] Connection opened, creating stream");
       resolve(new connectionClientStream(websocket));
     });
 
-    websocket.addEventListener("error", (event: Event) => {
+    websocket.on("error", (event: Event) => {
       const errorMessage = (event as ErrorEvent).message || "Unknown error";
       console.error(`[WebSocket] Connection error: ${errorMessage}`);
       reject(
